@@ -1,51 +1,83 @@
-#!/bin/bash
+# SonarQube Host URL (Must match your server's configuration)
 
-# --- Configuration ---
-# 🚨 ENSURE THIS IS CORRECT (e.g., host.docker.internal:9000 or a specific IP)
-SONARQUBE_URL="http://10.10.200.76:9000" 
-YOUR_REPO=$(pwd)                           
-PROJECT_BASE_DIR=$(pwd) # The directory being analyzed
+SONAR_HOST_URL="http://10.10.200.76:9000"
 
-# --- 1. Define Universal Project Properties ---
-# Get the name of the current directory (the last component of the path)
-# This uses the shell's parameter expansion to strip the path and get the folder name.
-PROJECT_KEY=$(basename "${PROJECT_BASE_DIR}")
-PROJECT_NAME="${PROJECT_KEY}" # Use the key as the name for simplicity
+# --- Automatic Variable Derivation ---
+# The project directory is the current directory where the script is run.
+PROJECT_DIR="$(pwd)"
 
-echo "Project Key: ${PROJECT_KEY}"
-echo "Project Name: ${PROJECT_NAME}"
-echo "---------------------------------------------------------"
+# The project name is the name of the current directory.
+PROJECT_NAME=$(basename "$PROJECT_DIR")
 
-# --- 2. Retrieve the SonarQube Token using the Python script ---
-echo "Attempting to retrieve SonarQube token from keyring..."
-# Use the full path to the Python script for robust execution
-SCRIPT_DIR=$(dirname "$0")
-SONAR_TOKEN=$(./get_sonarqube_token.py)
+# Automatically derive a unique project key from the project name
+# Replaces spaces and special characters with hyphens and converts to lowercase
+PROJECT_KEY=$(echo "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
 
-# Check for successful retrieval (omitted for brevity, assume it still works)
+# Get the token from the Python script
+SONAR_TOKEN=$(python get_sonarqube_token.py)
+
+# Check if the token was successfully retrieved
 if [ -z "$SONAR_TOKEN" ]; then
-    echo "❌ ERROR: Token retrieval failed. Please ensure the 'set' script was run."
+    echo "❌ Error: SonarQube token not found. Please run set_sonarqube_token.py first."
     exit 1
 fi
 
-echo "✅ Token successfully retrieved (first 5 characters: ${SONAR_TOKEN:0:5}*****)."
-echo "--- Starting SonarScanner Docker analysis ---"
+echo "Starting SonarQube analysis for project: $PROJECT_NAME"
+echo "Project Key: $PROJECT_KEY"
 
-# --- 3. Execute the Docker Command with Mandatory Properties ---
-# The mandatory project properties (sonar.projectKey and sonar.projectName) 
-# must be passed as -D properties via the SONAR_SCANNER_OPTS environment variable.
+# --- Run the SonarScanner analysis inside a Docker container ---
+# The token is now passed as a system property directly to sonar-scanner,
+# which is a more robust way of handling credentials.
 sudo docker run \
-    --rm \
-    --add-host="host.docker.internal:host-gateway" \
-    -e SONAR_HOST_URL="${SONARQUBE_URL}" \
-    -e SONAR_TOKEN="${SONAR_TOKEN}" \
-    -e SONAR_SCANNER_OPTS="-Dsonar.projectKey=${PROJECT_KEY} -Dsonar.projectName=${PROJECT_NAME}" \
-    -v "${YOUR_REPO}:/usr/src" \
-    sonarsource/sonar-scanner-cli
+  --rm \
+  -e SONAR_HOST_URL="$SONAR_HOST_URL" \
+  -v "$PROJECT_DIR":/usr/src \
+  sonarsource/sonar-scanner-cli \
+  -Dsonar.login="$SONAR_TOKEN" \
+  -Dsonar.projectKey="$PROJECT_KEY" \
+  -Dsonar.projectName="$PROJECT_NAME" \
+  -Dsonar.qualitygate.wait=true \
+  -Dsonar.qualitygate.timeout=300
 
-# Exit status check...
+# Check the exit status of the docker run command
 if [ $? -eq 0 ]; then
-    echo "✅ SonarScanner analysis completed successfully."
+    echo ""
+    echo "--------------------------------------------------------"
+    echo "✅ Analysis complete! The Quality Gate status is PASSED."
+    echo "--------------------------------------------------------"
 else
-    echo "❌ SonarScanner analysis failed."
+    # The sonar-scanner returns a non-zero exit code if the Quality Gate fails.
+    echo ""
+    echo "--------------------------------------------------------"
+    echo "⚠️ Analysis complete, but the Quality Gate FAILED."
+    echo "--------------------------------------------------------"
+    exit 1 # Exit with error status to signal a pipeline failure
 fi
+
+# --- Retrieve and display all issues from the SonarQube API ---
+echo ""
+echo "Fetching a full list of all issues for the project..."
+echo ""
+
+# Check for 'jq' dependency
+if ! command -v jq &> /dev/null
+then
+    echo "⚠️ Warning: The 'jq' command is not found. Please install it to format the JSON output."
+    echo "You can install it on Ubuntu with: sudo apt install jq"
+    echo "You can get it on macOS with: brew install jq"
+    echo "The raw API output will be printed below."
+    echo ""
+    curl -s -u "$SONAR_TOKEN": "$SONAR_HOST_URL/api/issues/search?projectKeys=$PROJECT_KEY&statuses=OPEN,CONFIRMED,REOPENED"
+else
+    # Use curl to call the API and jq to pretty-print the results.
+    # We retrieve issues with OPEN, CONFIRMED, and REOPENED statuses.
+    curl -s -u "$SONAR_TOKEN": "$SONAR_HOST_URL/api/issues/search?projectKeys=$PROJECT_KEY&statuses=OPEN,CONFIRMED,REOPENED" | \
+    jq '.issues[] | {severity: .severity, type: .type, message: .message, component: .component, line: .line}'
+fi
+
+echo ""
+echo "--------------------------------------------------------"
+echo "View the full report and all issues at:"
+echo "$SONAR_HOST_URL/dashboard?id=$PROJECT_KEY"
+echo "--------------------------------------------------------"
+
